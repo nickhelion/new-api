@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	openaiHelper "github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
@@ -230,10 +231,11 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	var responseText string
 	usage := &dto.Usage{}
 	var nodeToken int
+	var lastStreamData string
 	helper.SetEventStreamHeaders(c)
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		var difyResponse DifyChunkChatCompletionResponse
-		if err := json.Unmarshal([]byte(data), &difyResponse); err != nil {
+		if err := common.Unmarshal([]byte(data), &difyResponse); err != nil {
 			common.SysLog("error unmarshalling stream response: " + err.Error())
 			sr.Error(err)
 			return
@@ -253,12 +255,23 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 				nodeToken += 1
 			}
 		}
-		if err := helper.ObjectData(c, openaiResponse); err != nil {
+		// Delay-by-one pattern: send the previous chunk via HandleStreamFormat,
+		// save the current chunk for the next iteration or HandleFinalResponse.
+		if lastStreamData != "" {
+			if err := openaiHelper.HandleStreamFormat(c, info, lastStreamData, false, false); err != nil {
+				common.SysLog(err.Error())
+				sr.Error(err)
+			}
+		}
+		jsonBytes, err := common.Marshal(openaiResponse)
+		if err != nil {
 			common.SysLog(err.Error())
 			sr.Error(err)
+			return
 		}
+		lastStreamData = string(jsonBytes)
 	})
-	helper.Done(c)
+	openaiHelper.HandleFinalResponse(c, info, lastStreamData, "", 0, info.UpstreamModelName, "", usage, usage.TotalTokens > 0)
 	if usage.TotalTokens == 0 {
 		usage = service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens())
 	}
@@ -274,7 +287,7 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	service.CloseResponseBodyGracefully(resp)
-	err = json.Unmarshal(responseBody, &difyResponse)
+	err = common.Unmarshal(responseBody, &difyResponse)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
@@ -293,12 +306,18 @@ func difyHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 		FinishReason: "stop",
 	}
 	fullTextResponse.Choices = append(fullTextResponse.Choices, choice)
-	jsonResponse, err := json.Marshal(fullTextResponse)
+
+	var jsonResponse []byte
+	switch info.RelayFormat {
+	case types.RelayFormatClaude:
+		claudeResp := service.ResponseOpenAI2Claude(&fullTextResponse, info)
+		jsonResponse, err = common.Marshal(claudeResp)
+	default:
+		jsonResponse, err = common.Marshal(fullTextResponse)
+	}
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
-	c.Writer.Header().Set("Content-Type", "application/json")
-	c.Writer.WriteHeader(resp.StatusCode)
-	c.Writer.Write(jsonResponse)
+	service.IOCopyBytesGracefully(c, resp, jsonResponse)
 	return &difyResponse.MetaData.Usage, nil
 }
