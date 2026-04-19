@@ -15,9 +15,8 @@ type DifyChatRequest struct {
 
 type DifyFile struct {
 	Type         string `json:"type"`
-	TransferMode string `json:"transfer_mode"`
-	URL          string `json:"url,omitempty"`
-	UploadFileId string `json:"upload_file_id,omitempty"`
+	TransferMode string `json:"transfer_method"`
+	UploadFileId string `json:"upload_file_id"`
 }
 
 type DifyMetaData struct {

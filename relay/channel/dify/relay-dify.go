@@ -8,7 +8,6 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -23,103 +22,120 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func uploadDifyFile(c *gin.Context, info *relaycommon.RelayInfo, user string, media dto.MediaContent) *DifyFile {
+func downloadRemoteImage(imageUrl string) ([]byte, string, error) {
+	client := service.GetHttpClient()
+	resp, err := client.Get(imageUrl)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to download image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("failed to download image, status: %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read image body: %w", err)
+	}
+
+	mimeType := resp.Header.Get("Content-Type")
+	if mimeType == "" || !strings.HasPrefix(mimeType, "image/") {
+		mimeType = "image/png"
+	}
+
+	return data, mimeType, nil
+}
+
+func uploadImageDataToDify(info *relaycommon.RelayInfo, user string, imageData []byte, mimeType string) *DifyFile {
 	uploadUrl := fmt.Sprintf("%s/v1/files/upload", info.ChannelBaseUrl)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	if err := writer.WriteField("user", user); err != nil {
+		common.SysLog("failed to add user field: " + err.Error())
+		return nil
+	}
+
+	ext := strings.TrimPrefix(mimeType, "image/")
+	part, err := writer.CreateFormFile("file", fmt.Sprintf("image.%s", ext))
+	if err != nil {
+		common.SysLog("failed to create form file: " + err.Error())
+		return nil
+	}
+
+	if _, err = io.Copy(part, bytes.NewReader(imageData)); err != nil {
+		common.SysLog("failed to copy file content: " + err.Error())
+		return nil
+	}
+	writer.Close()
+
+	req, err := http.NewRequest("POST", uploadUrl, body)
+	if err != nil {
+		common.SysLog("failed to create request: " + err.Error())
+		return nil
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", info.ApiKey))
+
+	client := service.GetHttpClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		common.SysLog("failed to send request: " + err.Error())
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Id string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		common.SysLog("failed to decode response: " + err.Error())
+		return nil
+	}
+
+	return &DifyFile{
+		UploadFileId: result.Id,
+		Type:         "image",
+		TransferMode: "local_file",
+	}
+}
+
+func uploadDifyFile(c *gin.Context, info *relaycommon.RelayInfo, user string, media dto.MediaContent) *DifyFile {
 	switch media.Type {
 	case dto.ContentTypeImageURL:
-		// Decode base64 data
 		imageMedia := media.GetImageMedia()
+
+		if imageMedia.IsRemoteImage() {
+			// Download remote image then upload to Dify
+			imageData, mimeType, err := downloadRemoteImage(imageMedia.Url)
+			if err != nil {
+				common.SysLog("dify: " + err.Error())
+				return nil
+			}
+			return uploadImageDataToDify(info, user, imageData, mimeType)
+		}
+
+		// Base64 image: decode then upload
 		base64Data := imageMedia.Url
-		// Remove base64 prefix if exists (e.g., "data:image/jpeg;base64,")
 		if idx := strings.Index(base64Data, ","); idx != -1 {
 			base64Data = base64Data[idx+1:]
 		}
 
-		// Decode base64 string
 		decodedData, err := base64.StdEncoding.DecodeString(base64Data)
 		if err != nil {
 			common.SysLog("failed to decode base64: " + err.Error())
 			return nil
 		}
 
-		// Create temporary file
-		tempFile, err := os.CreateTemp("", "dify-upload-*")
-		if err != nil {
-			common.SysLog("failed to create temp file: " + err.Error())
-			return nil
-		}
-		defer tempFile.Close()
-		defer os.Remove(tempFile.Name())
-
-		// Write decoded data to temp file
-		if _, err := tempFile.Write(decodedData); err != nil {
-			common.SysLog("failed to write to temp file: " + err.Error())
-			return nil
-		}
-
-		// Create multipart form
-		body := &bytes.Buffer{}
-		writer := multipart.NewWriter(body)
-
-		// Add user field
-		if err := writer.WriteField("user", user); err != nil {
-			common.SysLog("failed to add user field: " + err.Error())
-			return nil
-		}
-
-		// Create form file with proper mime type
 		mimeType := imageMedia.MimeType
 		if mimeType == "" {
-			mimeType = "image/jpeg" // default mime type
+			mimeType = "image/jpeg"
 		}
 
-		// Create form file
-		part, err := writer.CreateFormFile("file", fmt.Sprintf("image.%s", strings.TrimPrefix(mimeType, "image/")))
-		if err != nil {
-			common.SysLog("failed to create form file: " + err.Error())
-			return nil
-		}
-
-		// Copy file content to form
-		if _, err = io.Copy(part, bytes.NewReader(decodedData)); err != nil {
-			common.SysLog("failed to copy file content: " + err.Error())
-			return nil
-		}
-		writer.Close()
-
-		// Create HTTP request
-		req, err := http.NewRequest("POST", uploadUrl, body)
-		if err != nil {
-			common.SysLog("failed to create request: " + err.Error())
-			return nil
-		}
-
-		req.Header.Set("Content-Type", writer.FormDataContentType())
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", info.ApiKey))
-
-		// Send request
-		client := service.GetHttpClient()
-		resp, err := client.Do(req)
-		if err != nil {
-			common.SysLog("failed to send request: " + err.Error())
-			return nil
-		}
-		defer resp.Body.Close()
-
-		// Parse response
-		var result struct {
-			Id string `json:"id"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			common.SysLog("failed to decode response: " + err.Error())
-			return nil
-		}
-
-		return &DifyFile{
-			UploadFileId: result.Id,
-			Type:         "image",
-			TransferMode: "local_file",
-		}
+		return uploadImageDataToDify(info, user, decodedData, mimeType)
 	}
 	return nil
 }
@@ -156,15 +172,7 @@ func requestOpenAI2Dify(c *gin.Context, info *relaycommon.RelayInfo, request dto
 				case dto.ContentTypeText:
 					content.WriteString("USER: \n" + mediaContent.Text + "\n")
 				case dto.ContentTypeImageURL:
-					media := mediaContent.GetImageMedia()
-					var file *DifyFile
-					if media.IsRemoteImage() {
-						file.Type = media.MimeType
-						file.TransferMode = "remote_url"
-						file.URL = media.Url
-					} else {
-						file = uploadDifyFile(c, info, difyReq.User, mediaContent)
-					}
+					file := uploadDifyFile(c, info, difyReq.User, mediaContent)
 					if file != nil {
 						files = append(files, *file)
 					}
