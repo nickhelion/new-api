@@ -1,11 +1,15 @@
 package controller
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -72,6 +76,62 @@ func TestTopUpQuotaValidation(t *testing.T) {
 			assert.Equal(t, tc.wantQuota, quota)
 		})
 	}
+}
+
+func TestAIModelTopupSignedRequest(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef"
+	const nonce = "0123456789abcdef0123456789abcdef"
+	const body = `{"operation_id":"stripe:cs_signed_test","token_id":7,"quota":20}`
+	t.Setenv("AIMODEL_GATEWAY_TOPUP_SECRET", secret)
+	t.Setenv("AIMODEL_GATEWAY_USER_ID", "42")
+	oldDB := model.DB
+	oldRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.AIModelTopupGrant{}))
+	model.DB = db
+	t.Cleanup(func() {
+		model.DB = oldDB
+		common.RedisEnabled = oldRedis
+		sqlDB, dbErr := db.DB()
+		if dbErr == nil {
+			assert.NoError(t, sqlDB.Close())
+		}
+	})
+	require.NoError(t, db.Create(&model.User{Id: 42, Username: "aimodel_signed", Status: common.UserStatusEnabled}).Error)
+	require.NoError(t, db.Create(&model.Token{Id: 7, UserId: 42, Key: "aimodel-signed-token", Status: common.TokenStatusExhausted, ExpiredTime: -1, RemainQuota: -10}).Error)
+	send := func(timestamp int64, signature string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/api/internal/aimodel/topup", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		ctx.Request.Header.Set("X-AIModel-Timestamp", fmt.Sprint(timestamp))
+		ctx.Request.Header.Set("X-AIModel-Nonce", nonce)
+		ctx.Request.Header.Set("X-AIModel-Signature", signature)
+		AIModelTopup(ctx)
+		return recorder
+	}
+	sign := func(timestamp int64) string {
+		digest := sha256.Sum256([]byte(body))
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write([]byte(fmt.Sprint(timestamp) + "\n" + nonce + "\n" + hex.EncodeToString(digest[:])))
+		return hex.EncodeToString(mac.Sum(nil))
+	}
+	now := time.Now().Unix()
+	assert.Equal(t, http.StatusUnauthorized, send(now, "").Code)
+	assert.Equal(t, http.StatusUnauthorized, send(now-301, sign(now-301)).Code)
+	assert.Equal(t, http.StatusUnauthorized, send(now, strings.Repeat("0", 64)).Code)
+	first := send(now, sign(now))
+	assert.Equal(t, http.StatusOK, first.Code)
+	assert.Contains(t, first.Body.String(), `"before_quota":-10`)
+	assert.Contains(t, first.Body.String(), `"after_quota":10`)
+	second := send(now, sign(now))
+	assert.Equal(t, http.StatusOK, second.Code)
+	assert.Contains(t, second.Body.String(), `"duplicate":true`)
+	var token model.Token
+	require.NoError(t, db.First(&token, 7).Error)
+	assert.Equal(t, 10, token.RemainQuota)
 }
 
 func TestValidateTopUpQuotaReturnsMaximumAmount(t *testing.T) {
