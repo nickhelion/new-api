@@ -40,7 +40,8 @@ type AIModelTopupResult struct {
 	AfterQuota  int
 }
 
-// GrantAIModelTopup credits both existing balances in a single transaction.
+// GrantAIModelTopup credits only the personal token budget in a transaction.
+// The shared user wallet is an independently funded operating pool.
 // A repeated operation succeeds only when its original target and amount match.
 func GrantAIModelTopup(operationID string, userID, tokenID, quota int) (result AIModelTopupResult, err error) {
 	if !operationIDPattern.MatchString(operationID) || userID <= 0 || tokenID <= 0 || quota <= 0 || quota > common.MaxWalletQuota {
@@ -104,15 +105,7 @@ func GrantAIModelTopup(operationID string, userID, tokenID, quota int) (result A
 		if tokenUpdate.RowsAffected != 1 {
 			return ErrAIModelTopupTarget
 		}
-		userUpdate := tx.Model(&User{}).Where("id = ? AND quota <= ?", userID, common.MaxWalletQuota-quota).
-			Update("quota", gorm.Expr("quota + ?", quota))
-		if userUpdate.Error != nil {
-			return userUpdate.Error
-		}
-		if userUpdate.RowsAffected != 1 {
-			return ErrAIModelTopupTarget
-		}
-		if err := tx.Model(&AIModelTopupGrant{}).Where("id = ?", persisted.ID).Updates(map[string]interface{}{
+		if err := tx.Model(&AIModelTopupGrant{}).Where("id = ?", persisted.ID).Updates(map[string]any{
 			"before_quota": result.BeforeQuota,
 			"after_quota":  result.AfterQuota,
 		}).Error; err != nil {
@@ -133,17 +126,6 @@ func GrantAIModelTopup(operationID string, userID, tokenID, quota int) (result A
 	// invalidate snapshots so the next read hydrates from the DB. This also
 	// repairs an ambiguous cache write from the first attempt.
 	if common.RedisEnabled {
-		if result.Duplicate {
-			if err := invalidateUserCache(userID); err != nil {
-				return result, fmt.Errorf("%w: invalidate user: %v", ErrAIModelTopupCache, err)
-			}
-		} else if err := cacheIncrUserQuota(userID, int64(quota)); err != nil {
-			// A failed cache write can be ambiguous. Deleting the hash is safe
-			// whether the increment did or did not reach Redis.
-			if clearErr := invalidateUserCache(userID); clearErr != nil {
-				return result, fmt.Errorf("%w: user delta: %v; invalidate: %v", ErrAIModelTopupCache, err, clearErr)
-			}
-		}
 		var token Token
 		if err := DB.Unscoped().Select("key").Where("id = ?", tokenID).First(&token).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) && result.Duplicate {

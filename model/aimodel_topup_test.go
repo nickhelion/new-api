@@ -41,7 +41,7 @@ func TestGrantAIModelTopup(t *testing.T) {
 	require.Equal(t, -50, token.RemainQuota)
 	require.Equal(t, common.TokenStatusExhausted, token.Status)
 	require.NoError(t, DB.First(&user, user.Id).Error)
-	require.Equal(t, 250, user.Quota)
+	require.Equal(t, 200, user.Quota)
 
 	result, err = GrantAIModelTopup("stripe:cs_test_001", user.Id, token.Id, 50)
 	require.NoError(t, err)
@@ -60,14 +60,14 @@ func TestGrantAIModelTopup(t *testing.T) {
 	require.Equal(t, 50, token.RemainQuota)
 	require.Equal(t, common.TokenStatusEnabled, token.Status)
 	require.NoError(t, DB.First(&user, user.Id).Error)
-	require.Equal(t, 350, user.Quota)
+	require.Equal(t, 200, user.Quota)
 
 	_, err = GrantAIModelTopup("bad", user.Id, token.Id, 10)
 	require.ErrorIs(t, err, ErrAIModelTopupInvalid)
 	_, err = GrantAIModelTopup("stripe:cs_test_003", user.Id, token.Id, common.MaxWalletQuota)
 	require.True(t, errors.Is(err, ErrAIModelTopupTarget)) // Atomic overflow guard.
 	require.NoError(t, DB.First(&user, user.Id).Error)
-	require.Equal(t, 350, user.Quota)
+	require.Equal(t, 200, user.Quota)
 	var count int64
 	require.NoError(t, DB.Model(&AIModelTopupGrant{}).Count(&count).Error)
 	require.EqualValues(t, 2, count)
@@ -86,8 +86,12 @@ func TestGrantAIModelTopupRetryRepairsCache(t *testing.T) {
 	require.NoError(t, err)
 
 	useUserCacheMiniRedis(t)
-	user.Quota = 0 // A stale Redis snapshot from before the durable grant.
+	// The shared operating pool cache must remain unchanged by a personal top-up.
+	user.Quota = 0
 	require.NoError(t, populateUserCache(user))
+	// Simulate a stale personal budget snapshot after the durable grant.
+	_, err = cacheInitToken(token)
+	require.NoError(t, err)
 	healthyClient := common.RDB
 	brokenClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 100 * time.Millisecond, ReadTimeout: 100 * time.Millisecond, WriteTimeout: 100 * time.Millisecond, MaxRetries: 0})
 	common.RDB = brokenClient
@@ -102,7 +106,10 @@ func TestGrantAIModelTopupRetryRepairsCache(t *testing.T) {
 	assert.Equal(t, 25, result.AfterQuota)
 	quota, err := GetUserQuota(user.Id, false)
 	require.NoError(t, err)
-	assert.Equal(t, 20, quota)
+	assert.Equal(t, 0, quota)
+	cached, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, 25, cached.RemainQuota)
 	require.NoError(t, DB.First(&token, token.Id).Error)
 	assert.Equal(t, 25, token.RemainQuota)
 }
@@ -196,7 +203,7 @@ func TestGrantAIModelTopupDialects(t *testing.T) {
 			require.NoError(t, DB.First(&token, token.Id).Error)
 			assert.Equal(t, 15, token.RemainQuota)
 			require.NoError(t, DB.First(&user, user.Id).Error)
-			assert.Equal(t, 25, user.Quota)
+			assert.Equal(t, 0, user.Quota)
 		})
 	}
 }
