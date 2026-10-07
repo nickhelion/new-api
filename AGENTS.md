@@ -1,6 +1,12 @@
 # AGENTS.md — Project Conventions for new-api
 
-DO NOT send optional commentary
+## AI Model 分支定位与协作入口
+
+本仓库的自有 remote 是 `nickhelion/new-api`，AI Model 开发分支为 `aimodel-stripe-topup`。它负责 AI Model 的额度账本、结算、模型价格、上游渠道与 Stripe 充值原子履约；身份和支付编排由 `aimodel-gateway` 承担，官网展示在 `aimodel-site`。
+
+协调入口为 `nickhelion/aimodel`，issue 统一在协调仓库。在 hub 的 `aimodel-newapi/` 内工作时读取 [协调规则](../AGENTS.md) 与 [项目地图](../PROJECT-MAP.md)；独立克隆或旧 worktree 则读取 GitHub 协调仓库同名文件。用中文交流，先核对分支及未提交改动，再建立自己的工作分支；保留本文件下方的上游技术、许可证和来源规则，只向明确指定的 `origin` 推送 AI Model 工作。
+
+`aimodel-newapi-rc37` 与 `new-api` 是同一仓库的本机 worktree，不代表两个产品仓库。旧主 checkout 的分支和前端工具链可能不同，不能套用到 AI Model 分支。凭据留在仓库外，额度操作、定价和生产发布按协调仓库对应技能、ADR 与发行规程执行。
 
 ## Overview
 
